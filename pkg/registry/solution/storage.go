@@ -38,6 +38,10 @@ func key(ns, name string) string { return ns + "/" + name }
 
 func (s *SolutionStorage) NamespaceScoped() bool { return true }
 
+// --- rest.SingularNameProvider ---
+
+func (s *SolutionStorage) GetSingularName() string { return "solution" }
+
 // --- rest.StandardStorage ---
 
 func (s *SolutionStorage) New() runtime.Object { return &internal.Solution{} }
