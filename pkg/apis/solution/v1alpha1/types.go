@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type Solution struct {
@@ -42,4 +43,21 @@ type SolutionList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Solution `json:"items"`
+}
+
+func (in *Solution) DeepCopyObject() runtime.Object {
+	out := new(Solution)
+	*out = *in
+	out.Status.Conditions = append([]metav1.Condition(nil), in.Status.Conditions...)
+	return out
+}
+
+func (in *SolutionList) DeepCopyObject() runtime.Object {
+	out := new(SolutionList)
+	*out = *in
+	out.Items = make([]Solution, len(in.Items))
+	for i := range in.Items {
+		out.Items[i] = *in.Items[i].DeepCopyObject().(*Solution)
+	}
+	return out
 }
