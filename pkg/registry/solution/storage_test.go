@@ -7,6 +7,8 @@ import (
 	internal "github.com/piotrmiskiewicz/custom-api-server/pkg/apis/solution"
 	registry "github.com/piotrmiskiewicz/custom-api-server/pkg/registry/solution"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/endpoints/request"
 )
@@ -63,6 +65,54 @@ func TestStorage_List(t *testing.T) {
 	sl := list.(*internal.SolutionList)
 	if len(sl.Items) != 2 {
 		t.Errorf("List: got %d items, want 2", len(sl.Items))
+	}
+}
+
+func TestStorage_ListFieldSelector(t *testing.T) {
+	store := registry.NewSolutionStorage()
+	ctx := ctxWithNamespace("default")
+	noopValidate := func(ctx context.Context, obj runtime.Object) error { return nil }
+
+	for _, tc := range []struct{ name, solutionName string }{
+		{"s1", "alpha"},
+		{"s2", "beta"},
+		{"s3", "alpha"},
+	} {
+		_, err := store.Create(ctx, &internal.Solution{
+			ObjectMeta: metav1.ObjectMeta{Name: tc.name, Namespace: "default"},
+			Spec:       internal.SolutionSpec{SolutionName: tc.solutionName},
+		}, noopValidate, &metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Create %s: %v", tc.name, err)
+		}
+	}
+
+	list, err := store.List(ctx, &metainternalversion.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.solutionName", "alpha"),
+	})
+	if err != nil {
+		t.Fatalf("List with field selector: %v", err)
+	}
+	items := list.(*internal.SolutionList).Items
+	if len(items) != 2 {
+		t.Errorf("expected 2 items with solutionName=alpha, got %d", len(items))
+	}
+	for _, item := range items {
+		if item.Spec.SolutionName != "alpha" {
+			t.Errorf("unexpected solutionName %q in result", item.Spec.SolutionName)
+		}
+	}
+}
+
+func TestStorage_ListFieldSelectorUnknownField(t *testing.T) {
+	store := registry.NewSolutionStorage()
+	ctx := ctxWithNamespace("default")
+
+	_, err := store.List(ctx, &metainternalversion.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.unknown", "x"),
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown field selector, got nil")
 	}
 }
 

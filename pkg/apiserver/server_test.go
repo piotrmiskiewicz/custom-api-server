@@ -7,7 +7,7 @@ import (
 )
 
 func TestNew_ReturnsServer(t *testing.T) {
-	srv, err := apiserver.New()
+	srv, err := apiserver.New("", "", ":0")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -17,7 +17,7 @@ func TestNew_ReturnsServer(t *testing.T) {
 }
 
 func TestNew_HasAPIsRoute(t *testing.T) {
-	srv, err := apiserver.New()
+	srv, err := apiserver.New("", "", ":0")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}

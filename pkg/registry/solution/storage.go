@@ -2,6 +2,7 @@ package solution
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -10,6 +11,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -21,36 +24,67 @@ import (
 
 var solutionGR = schema.GroupResource{Group: "solution.piotrmiskiewicz.github.com", Resource: "solutions"}
 
-// SolutionStorage is an in-memory REST storage for Solution objects.
-type SolutionStorage struct {
+// Storage is the interface both InMemoryStorage and PostgresStorage implement.
+type Storage interface {
+	rest.StandardStorage
+	rest.SingularNameProvider
+}
+
+// StatusUpdater is an optional interface for storage backends that can update
+// only the status subresource atomically, preserving spec.
+type StatusUpdater interface {
+	UpdateStatus(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, error)
+}
+
+// GetAttrs returns the label set, field set, and error for a Solution object.
+// Supported field selectors: metadata.name, metadata.namespace, spec.solutionName.
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
+	sol, ok := obj.(*internal.Solution)
+	if !ok {
+		return nil, nil, fmt.Errorf("not a Solution")
+	}
+	return labels.Set(sol.Labels), fields.Set{
+		"metadata.name":      sol.Name,
+		"metadata.namespace": sol.Namespace,
+		"spec.solutionName":  sol.Spec.SolutionName,
+	}, nil
+}
+
+// InMemoryStorage is an in-memory REST storage for Solution objects.
+type InMemoryStorage struct {
 	mu      sync.RWMutex
 	objects map[string]*internal.Solution // key: namespace/name
 }
 
-// NewSolutionStorage creates an empty SolutionStorage.
-func NewSolutionStorage() *SolutionStorage {
-	return &SolutionStorage{objects: make(map[string]*internal.Solution)}
+// NewInMemoryStorage creates an empty InMemoryStorage.
+func NewInMemoryStorage() *InMemoryStorage {
+	return &InMemoryStorage{objects: make(map[string]*internal.Solution)}
+}
+
+// NewSolutionStorage is an alias for NewInMemoryStorage for backwards compatibility.
+func NewSolutionStorage() *InMemoryStorage {
+	return NewInMemoryStorage()
 }
 
 func key(ns, name string) string { return ns + "/" + name }
 
 // --- rest.Scoper ---
 
-func (s *SolutionStorage) NamespaceScoped() bool { return true }
+func (s *InMemoryStorage) NamespaceScoped() bool { return true }
 
 // --- rest.SingularNameProvider ---
 
-func (s *SolutionStorage) GetSingularName() string { return "solution" }
+func (s *InMemoryStorage) GetSingularName() string { return "solution" }
 
 // --- rest.StandardStorage ---
 
-func (s *SolutionStorage) New() runtime.Object { return &internal.Solution{} }
+func (s *InMemoryStorage) New() runtime.Object { return &internal.Solution{} }
 
-func (s *SolutionStorage) NewList() runtime.Object { return &internal.SolutionList{} }
+func (s *InMemoryStorage) NewList() runtime.Object { return &internal.SolutionList{} }
 
-func (s *SolutionStorage) Destroy() {}
+func (s *InMemoryStorage) Destroy() {}
 
-func (s *SolutionStorage) Get(ctx context.Context, name string, _ *metav1.GetOptions) (runtime.Object, error) {
+func (s *InMemoryStorage) Get(ctx context.Context, name string, _ *metav1.GetOptions) (runtime.Object, error) {
 	ns, _ := request.NamespaceFrom(ctx)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -61,21 +95,50 @@ func (s *SolutionStorage) Get(ctx context.Context, name string, _ *metav1.GetOpt
 	return obj.DeepCopyObject(), nil
 }
 
-func (s *SolutionStorage) List(ctx context.Context, _ *metainternalversion.ListOptions) (runtime.Object, error) {
+func (s *InMemoryStorage) List(ctx context.Context, opts *metainternalversion.ListOptions) (runtime.Object, error) {
 	ns, _ := request.NamespaceFrom(ctx)
+
+	var fieldSel fields.Selector
+	if opts != nil && opts.FieldSelector != nil {
+		if err := validateFieldSelector(opts.FieldSelector); err != nil {
+			return nil, errors.NewBadRequest(err.Error())
+		}
+		fieldSel = opts.FieldSelector
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	list := &internal.SolutionList{}
 	for k, v := range s.objects {
 		// key format is "namespace/name"; match prefix "namespace/"
-		if ns == "" || len(k) > len(ns) && k[:len(ns)+1] == ns+"/" {
-			list.Items = append(list.Items, *v.DeepCopyObject().(*internal.Solution))
+		if ns != "" && !(len(k) > len(ns) && k[:len(ns)+1] == ns+"/") {
+			continue
 		}
+		if fieldSel != nil && !fieldSel.Empty() {
+			_, fieldSet, _ := GetAttrs(v)
+			if !fieldSel.Matches(fieldSet) {
+				continue
+			}
+		}
+		list.Items = append(list.Items, *v.DeepCopyObject().(*internal.Solution))
 	}
 	return list, nil
 }
 
-func (s *SolutionStorage) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, _ *metav1.CreateOptions) (runtime.Object, error) {
+// validateFieldSelector rejects field names that are not supported.
+func validateFieldSelector(sel fields.Selector) error {
+	for _, req := range sel.Requirements() {
+		switch req.Field {
+		case "metadata.name", "metadata.namespace", "spec.solutionName":
+			// supported
+		default:
+			return fmt.Errorf("field selector %q is not supported; supported fields: metadata.name, metadata.namespace, spec.solutionName", req.Field)
+		}
+	}
+	return nil
+}
+
+func (s *InMemoryStorage) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, _ *metav1.CreateOptions) (runtime.Object, error) {
 	sol := obj.(*internal.Solution)
 	ns, _ := request.NamespaceFrom(ctx)
 	if sol.Namespace == "" {
@@ -98,7 +161,7 @@ func (s *SolutionStorage) Create(ctx context.Context, obj runtime.Object, create
 	return cp.DeepCopyObject(), nil
 }
 
-func (s *SolutionStorage) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, _ bool, _ *metav1.UpdateOptions) (runtime.Object, bool, error) {
+func (s *InMemoryStorage) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, _ bool, _ *metav1.UpdateOptions) (runtime.Object, bool, error) {
 	ns, _ := request.NamespaceFrom(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -122,7 +185,7 @@ func (s *SolutionStorage) Update(ctx context.Context, name string, objInfo rest.
 	return cp.DeepCopyObject(), false, nil
 }
 
-func (s *SolutionStorage) Delete(ctx context.Context, name string, deleteValidation rest.ValidateObjectFunc, _ *metav1.DeleteOptions) (runtime.Object, bool, error) {
+func (s *InMemoryStorage) Delete(ctx context.Context, name string, deleteValidation rest.ValidateObjectFunc, _ *metav1.DeleteOptions) (runtime.Object, bool, error) {
 	ns, _ := request.NamespaceFrom(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -138,23 +201,67 @@ func (s *SolutionStorage) Delete(ctx context.Context, name string, deleteValidat
 	return obj, true, nil
 }
 
-func (s *SolutionStorage) Watch(_ context.Context, _ *metainternalversion.ListOptions) (watch.Interface, error) {
+func (s *InMemoryStorage) Watch(_ context.Context, _ *metainternalversion.ListOptions) (watch.Interface, error) {
 	return nil, errors.NewMethodNotSupported(solutionGR, "watch")
 }
 
-func (s *SolutionStorage) ConvertToTable(ctx context.Context, obj runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+func (s *InMemoryStorage) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, _ *metav1.DeleteOptions, listOpts *metainternalversion.ListOptions) (runtime.Object, error) {
+	listed, err := s.List(ctx, listOpts)
+	if err != nil {
+		return nil, err
+	}
+	sl := listed.(*internal.SolutionList)
+	ns, _ := request.NamespaceFrom(ctx)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range sl.Items {
+		obj := &sl.Items[i]
+		if err := deleteValidation(ctx, obj); err != nil {
+			return nil, err
+		}
+		delete(s.objects, key(ns, obj.Name))
+	}
+	return sl, nil
+}
+
+func (s *InMemoryStorage) ConvertToTable(ctx context.Context, obj runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
 	return rest.NewDefaultTableConvertor(solutionGR).ConvertToTable(ctx, obj, tableOptions)
+}
+
+// UpdateStatus updates only the status field, preserving spec and metadata.
+// It implements the StatusUpdater interface.
+func (s *InMemoryStorage) UpdateStatus(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, error) {
+	ns, _ := request.NamespaceFrom(ctx)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := key(ns, name)
+	existing, ok := s.objects[k]
+	if !ok {
+		return nil, errors.NewNotFound(solutionGR, name)
+	}
+	updated, err := objInfo.UpdatedObject(ctx, existing)
+	if err != nil {
+		return nil, err
+	}
+	updatedSol := updated.(*internal.Solution)
+	// Only copy status — spec and metadata remain from existing.
+	existing.Status = updatedSol.Status
+	rv, _ := strconv.Atoi(existing.ResourceVersion)
+	existing.ResourceVersion = strconv.Itoa(rv + 1)
+	cp := existing.DeepCopyObject().(*internal.Solution)
+	s.objects[k] = cp
+	return cp.DeepCopyObject(), nil
 }
 
 // --- StatusREST ---
 
 // StatusREST handles updates to the /status subresource.
 type StatusREST struct {
-	store *SolutionStorage
+	store Storage
 }
 
-// NewStatusREST creates a StatusREST that shares the given SolutionStorage.
-func NewStatusREST(store *SolutionStorage) *StatusREST {
+// NewStatusREST creates a StatusREST that shares the given Storage.
+func NewStatusREST(store Storage) *StatusREST {
 	return &StatusREST{store: store}
 }
 
@@ -163,26 +270,12 @@ func (r *StatusREST) New() runtime.Object { return &internal.Solution{} }
 func (r *StatusREST) Destroy() {}
 
 func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, _ rest.ValidateObjectFunc, _ rest.ValidateObjectUpdateFunc, _ bool, _ *metav1.UpdateOptions) (runtime.Object, bool, error) {
-	ns, _ := request.NamespaceFrom(ctx)
-	r.store.mu.Lock()
-	defer r.store.mu.Unlock()
-	k := key(ns, name)
-	existing, ok := r.store.objects[k]
-	if !ok {
-		return nil, false, errors.NewNotFound(solutionGR, name)
+	if su, ok := r.store.(StatusUpdater); ok {
+		obj, err := su.UpdateStatus(ctx, name, objInfo)
+		return obj, false, err
 	}
-	updated, err := objInfo.UpdatedObject(ctx, existing)
-	if err != nil {
-		return nil, false, err
-	}
-	updatedSol := updated.(*internal.Solution)
-	// Only copy status — spec and metadata remain from existing.
-	existing.Status = updatedSol.Status
-	rv, _ := strconv.Atoi(existing.ResourceVersion)
-	existing.ResourceVersion = strconv.Itoa(rv + 1)
-	cp := existing.DeepCopyObject().(*internal.Solution)
-	r.store.objects[k] = cp
-	return cp.DeepCopyObject(), false, nil
+	// Fallback: use generic Update (spec changes won't be filtered).
+	return r.store.Update(ctx, name, objInfo, func(_ context.Context, _ runtime.Object) error { return nil }, func(_ context.Context, _, _ runtime.Object) error { return nil }, false, &metav1.UpdateOptions{})
 }
 
 // UpdateFunc adapts a plain function to rest.UpdatedObjectInfo for use in tests.
