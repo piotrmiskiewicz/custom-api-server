@@ -12,8 +12,8 @@ SERVER="${1:-https://localhost:8443}"
 KUBECTL="kubectl --server=${SERVER} --insecure-skip-tls-verify"
 
 NAMESPACES=10
-TOTAL=50000
-PER_NS=$(( TOTAL / NAMESPACES ))   # 5 000 per namespace
+TOTAL=500000
+PER_NS=$(( TOTAL / NAMESPACES ))   # 50 000 per namespace
 BATCH=500                           # objects per kubectl apply call
 PARALLEL=8                          # concurrent kubectl apply processes
 
@@ -41,10 +41,10 @@ for i in $(seq 1 $NAMESPACES); do
 apiVersion: solution.piotrmiskiewicz.github.com/v1alpha1
 kind: Solution
 metadata:
-  name: solution-$(printf '%05d' $j)
+  name: sol-$(printf '%06d' $j)
   namespace: ${NS}
 spec:
-  solutionName: solution-$(printf '%05d' $j)
+  solutionName: solution-$(printf '%06d' $j)
 EOF
     done
     (( batch_num++ ))

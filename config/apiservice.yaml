@@ -1,0 +1,14 @@
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.solution.piotrmiskiewicz.github.com
+spec:
+  group: solution.piotrmiskiewicz.github.com
+  version: v1alpha1
+  groupPriorityMinimum: 1000
+  versionPriority: 100
+  service:
+    name: custom-api-server
+    namespace: default
+    port: 443
+  insecureSkipTLSVerify: true

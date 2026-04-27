@@ -9,6 +9,7 @@ import (
     "crypto/x509/pkix"
     "encoding/pem"
     "fmt"
+    "log"
     "math/big"
     "net"
     "os"
@@ -175,8 +176,8 @@ func New(certFile, keyFile, addr string) (*genericapiserver.GenericAPIServer, er
             "io.k8s.apimachinery.pkg.apis.meta.v1.UpdateOptions":             {Schema: specv3.Schema{}},
             "io.k8s.apimachinery.pkg.apis.meta.v1.WatchEvent":                {Schema: specv3.Schema{}},
             // Custom types — no OpenAPIModelName(), keyed by Go import path.
-            // Full structural schemas are required so the field manager (server-side apply)
-            // can build a typed representation; empty schemas cause "[SHOULD NOT HAPPEN]" log spam.
+            // All fields are inlined (no $ref) to avoid cross-reference validation
+            // errors in the OpenAPI v2 schema validator used by kubectl.
             "github.com/piotrmiskiewicz/custom-api-server/pkg/apis/solution/v1alpha1.SolutionSpec": {
                 Schema: specv3.Schema{
                     SchemaProps: specv3.SchemaProps{
@@ -198,10 +199,8 @@ func New(certFile, keyFile, addr string) (*genericapiserver.GenericAPIServer, er
                                 Enum: []interface{}{"Pending", "Scheduling", "Deploying", "Running", "Failed", "Deleting", ""},
                             }},
                             "conditions": {SchemaProps: specv3.SchemaProps{
-                                Type: specv3.StringOrArray{"array"},
-                                Items: &specv3.SchemaOrArray{Schema: &specv3.Schema{
-                                    SchemaProps: specv3.SchemaProps{Ref: specv3.MustCreateRef("#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.Condition")},
-                                }},
+                                Type:  specv3.StringOrArray{"array"},
+                                Items: &specv3.SchemaOrArray{Schema: &specv3.Schema{SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"object"}}}},
                             }},
                         },
                     },
@@ -214,9 +213,15 @@ func New(certFile, keyFile, addr string) (*genericapiserver.GenericAPIServer, er
                         Properties: map[string]specv3.Schema{
                             "apiVersion": {SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"string"}}},
                             "kind":       {SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"string"}}},
-                            "metadata":   {SchemaProps: specv3.SchemaProps{Ref: specv3.MustCreateRef("#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta")}},
-                            "spec":       {SchemaProps: specv3.SchemaProps{Ref: specv3.MustCreateRef("#/definitions/github.com/piotrmiskiewicz/custom-api-server/pkg/apis/solution/v1alpha1.SolutionSpec")}},
-                            "status":     {SchemaProps: specv3.SchemaProps{Ref: specv3.MustCreateRef("#/definitions/github.com/piotrmiskiewicz/custom-api-server/pkg/apis/solution/v1alpha1.SolutionStatus")}},
+                            "metadata":   {SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"object"}}},
+                            "spec": {SchemaProps: specv3.SchemaProps{
+                                Type: specv3.StringOrArray{"object"},
+                                Properties: map[string]specv3.Schema{
+                                    "solutionName": {SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"string"}}},
+                                },
+                                Required: []string{"solutionName"},
+                            }},
+                            "status": {SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"object"}}},
                         },
                     },
                 },
@@ -228,12 +233,10 @@ func New(certFile, keyFile, addr string) (*genericapiserver.GenericAPIServer, er
                         Properties: map[string]specv3.Schema{
                             "apiVersion": {SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"string"}}},
                             "kind":       {SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"string"}}},
-                            "metadata":   {SchemaProps: specv3.SchemaProps{Ref: specv3.MustCreateRef("#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta")}},
+                            "metadata":   {SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"object"}}},
                             "items": {SchemaProps: specv3.SchemaProps{
-                                Type: specv3.StringOrArray{"array"},
-                                Items: &specv3.SchemaOrArray{Schema: &specv3.Schema{
-                                    SchemaProps: specv3.SchemaProps{Ref: specv3.MustCreateRef("#/definitions/github.com/piotrmiskiewicz/custom-api-server/pkg/apis/solution/v1alpha1.Solution")},
-                                }},
+                                Type:  specv3.StringOrArray{"array"},
+                                Items: &specv3.SchemaOrArray{Schema: &specv3.Schema{SchemaProps: specv3.SchemaProps{Type: specv3.StringOrArray{"object"}}}},
                             }},
                         },
                         Required: []string{"items"},
@@ -288,6 +291,7 @@ func New(certFile, keyFile, addr string) (*genericapiserver.GenericAPIServer, er
 func newStorage() (registry.Storage, *registry.StatusREST, error) {
     switch os.Getenv("STORAGE_BACKEND") {
     case "postgres":
+        log.Println("Using PostgreSQL storage backend")
         dsn := os.Getenv("POSTGRES_DSN")
         if dsn == "" {
             return nil, nil, fmt.Errorf("POSTGRES_DSN must be set when STORAGE_BACKEND=postgres")
@@ -298,6 +302,7 @@ func newStorage() (registry.Storage, *registry.StatusREST, error) {
         }
         return pgStore, registry.NewStatusREST(pgStore), nil
     default:
+        log.Println("Using in-memory storage backend")
         memStore := registry.NewSolutionStorage()
         return memStore, registry.NewStatusREST(memStore), nil
     }

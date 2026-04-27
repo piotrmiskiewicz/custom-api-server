@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: apiserver
+      POSTGRES_PASSWORD: apiserver
+      POSTGRES_DB: apiserver
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apiserver"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api-server:
+    build: .
+    ports:
+      - "8444:8443"
+    environment:
+      STORAGE_BACKEND: postgres
+      POSTGRES_DSN: postgres://apiserver:apiserver@postgres:5432/apiserver
+    depends_on:
+      postgres:
+        condition: service_healthy
