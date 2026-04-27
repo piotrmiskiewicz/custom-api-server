@@ -52,8 +52,9 @@ func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 
 // InMemoryStorage is an in-memory REST storage for Solution objects.
 type InMemoryStorage struct {
-    mu      sync.RWMutex
-    objects map[string]*internal.Solution // key: namespace/name
+    mu       sync.RWMutex
+    objects  map[string]*internal.Solution // key: namespace/name
+    watchers []*watcher
 }
 
 // NewInMemoryStorage creates an empty InMemoryStorage.
@@ -67,6 +68,18 @@ func NewSolutionStorage() *InMemoryStorage {
 }
 
 func key(ns, name string) string { return ns + "/" + name }
+
+// broadcast sends an event to all active watchers and removes stopped ones.
+// Must be called with mu held (write lock).
+func (s *InMemoryStorage) broadcast(eventType watch.EventType, obj *internal.Solution) {
+	alive := s.watchers[:0]
+	for _, w := range s.watchers {
+		if w.send(eventType, obj) {
+			alive = append(alive, w)
+		}
+	}
+	s.watchers = alive
+}
 
 // --- rest.Scoper ---
 
@@ -158,6 +171,7 @@ func (s *InMemoryStorage) Create(ctx context.Context, obj runtime.Object, create
     sol.CreationTimestamp = metav1.NewTime(time.Now())
     cp := sol.DeepCopyObject().(*internal.Solution)
     s.objects[k] = cp
+    s.broadcast(watch.Added, cp)
     return cp.DeepCopyObject(), nil
 }
 
@@ -182,6 +196,7 @@ func (s *InMemoryStorage) Update(ctx context.Context, name string, objInfo rest.
     sol.ResourceVersion = strconv.Itoa(rv + 1)
     cp := sol.DeepCopyObject().(*internal.Solution)
     s.objects[k] = cp
+    s.broadcast(watch.Modified, cp)
     return cp.DeepCopyObject(), false, nil
 }
 
@@ -198,11 +213,29 @@ func (s *InMemoryStorage) Delete(ctx context.Context, name string, deleteValidat
         return nil, false, err
     }
     delete(s.objects, k)
+    s.broadcast(watch.Deleted, obj)
     return obj, true, nil
 }
 
-func (s *InMemoryStorage) Watch(_ context.Context, opts *metainternalversion.ListOptions) (watch.Interface, error) {
-    return nil, errors.NewMethodNotSupported(solutionGR, "watch")
+func (s *InMemoryStorage) Watch(ctx context.Context, opts *metainternalversion.ListOptions) (watch.Interface, error) {
+    ns, _ := request.NamespaceFrom(ctx)
+
+    var fieldSel fields.Selector
+    if opts != nil && opts.FieldSelector != nil {
+        if err := validateFieldSelector(opts.FieldSelector); err != nil {
+            return nil, errors.NewBadRequest(err.Error())
+        }
+        fieldSel = opts.FieldSelector
+    }
+
+    wctx, cancel := context.WithCancel(ctx)
+    w := newWatcher(ns, fieldSel, cancel, wctx)
+
+    s.mu.Lock()
+    s.watchers = append(s.watchers, w)
+    s.mu.Unlock()
+
+    return w, nil
 }
 
 func (s *InMemoryStorage) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, _ *metav1.DeleteOptions, listOpts *metainternalversion.ListOptions) (runtime.Object, error) {

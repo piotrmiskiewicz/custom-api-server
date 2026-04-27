@@ -3,6 +3,7 @@ package solution_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	internal "github.com/piotrmiskiewicz/custom-api-server/pkg/apis/solution"
 	registry "github.com/piotrmiskiewicz/custom-api-server/pkg/registry/solution"
@@ -10,6 +11,7 @@ import (
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
@@ -172,5 +174,189 @@ func TestStatusREST_Update(t *testing.T) {
 	}
 	if s.Spec.SolutionName != "orig" {
 		t.Errorf("Spec must not change via status update, got %q", s.Spec.SolutionName)
+	}
+}
+
+func TestWatch_Create(t *testing.T) {
+	store := registry.NewSolutionStorage()
+	ctx := ctxWithNamespace("default")
+
+	w, err := store.Watch(ctx, nil)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	defer w.Stop()
+
+	store.Create(ctx, &internal.Solution{
+		ObjectMeta: metav1.ObjectMeta{Name: "w1", Namespace: "default"},
+		Spec:       internal.SolutionSpec{SolutionName: "foo"},
+	}, func(_ context.Context, _ runtime.Object) error { return nil }, &metav1.CreateOptions{})
+
+	select {
+	case ev := <-w.ResultChan():
+		if ev.Type != watch.Added {
+			t.Errorf("expected Added, got %v", ev.Type)
+		}
+		sol := ev.Object.(*internal.Solution)
+		if sol.Name != "w1" {
+			t.Errorf("expected name w1, got %s", sol.Name)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watch event")
+	}
+}
+
+func TestWatch_Update(t *testing.T) {
+	store := registry.NewSolutionStorage()
+	ctx := ctxWithNamespace("default")
+
+	store.Create(ctx, &internal.Solution{
+		ObjectMeta: metav1.ObjectMeta{Name: "w2", Namespace: "default"},
+		Spec:       internal.SolutionSpec{SolutionName: "orig"},
+	}, func(_ context.Context, _ runtime.Object) error { return nil }, &metav1.CreateOptions{})
+
+	w, err := store.Watch(ctx, nil)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	defer w.Stop()
+
+	store.Update(ctx, "w2", registry.UpdateFunc(func(_ context.Context, obj runtime.Object, _ bool) (runtime.Object, bool, error) {
+		s := obj.(*internal.Solution)
+		s.Spec.SolutionName = "updated"
+		return s, false, nil
+	}), func(_ context.Context, _ runtime.Object) error { return nil },
+		func(_ context.Context, _, _ runtime.Object) error { return nil },
+		false, &metav1.UpdateOptions{})
+
+	select {
+	case ev := <-w.ResultChan():
+		if ev.Type != watch.Modified {
+			t.Errorf("expected Modified, got %v", ev.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watch event")
+	}
+}
+
+func TestWatch_Delete(t *testing.T) {
+	store := registry.NewSolutionStorage()
+	ctx := ctxWithNamespace("default")
+
+	store.Create(ctx, &internal.Solution{
+		ObjectMeta: metav1.ObjectMeta{Name: "w3", Namespace: "default"},
+	}, func(_ context.Context, _ runtime.Object) error { return nil }, &metav1.CreateOptions{})
+
+	w, err := store.Watch(ctx, nil)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	defer w.Stop()
+
+	store.Delete(ctx, "w3", func(_ context.Context, _ runtime.Object) error { return nil }, &metav1.DeleteOptions{})
+
+	select {
+	case ev := <-w.ResultChan():
+		if ev.Type != watch.Deleted {
+			t.Errorf("expected Deleted, got %v", ev.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watch event")
+	}
+}
+
+func TestWatch_NamespaceFilter(t *testing.T) {
+	store := registry.NewSolutionStorage()
+	ctxA := ctxWithNamespace("ns-a")
+	ctxB := ctxWithNamespace("ns-b")
+
+	wA, _ := store.Watch(ctxA, nil)
+	wB, _ := store.Watch(ctxB, nil)
+	defer wA.Stop()
+	defer wB.Stop()
+
+	store.Create(ctxA, &internal.Solution{
+		ObjectMeta: metav1.ObjectMeta{Name: "sol-a", Namespace: "ns-a"},
+	}, func(_ context.Context, _ runtime.Object) error { return nil }, &metav1.CreateOptions{})
+
+	select {
+	case ev := <-wA.ResultChan():
+		if ev.Type != watch.Added {
+			t.Errorf("wA: expected Added, got %v", ev.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wA: timed out waiting for event")
+	}
+
+	select {
+	case ev := <-wB.ResultChan():
+		t.Errorf("wB: unexpected event %v", ev.Type)
+	case <-time.After(100 * time.Millisecond):
+		// expected
+	}
+}
+
+func TestWatch_FieldSelectorFilter(t *testing.T) {
+	store := registry.NewSolutionStorage()
+	ctx := ctxWithNamespace("default")
+
+	w, err := store.Watch(ctx, &metainternalversion.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.solutionName", "alpha"),
+	})
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	defer w.Stop()
+
+	store.Create(ctx, &internal.Solution{
+		ObjectMeta: metav1.ObjectMeta{Name: "match", Namespace: "default"},
+		Spec:       internal.SolutionSpec{SolutionName: "alpha"},
+	}, func(_ context.Context, _ runtime.Object) error { return nil }, &metav1.CreateOptions{})
+
+	store.Create(ctx, &internal.Solution{
+		ObjectMeta: metav1.ObjectMeta{Name: "nomatch", Namespace: "default"},
+		Spec:       internal.SolutionSpec{SolutionName: "beta"},
+	}, func(_ context.Context, _ runtime.Object) error { return nil }, &metav1.CreateOptions{})
+
+	select {
+	case ev := <-w.ResultChan():
+		sol := ev.Object.(*internal.Solution)
+		if sol.Name != "match" {
+			t.Errorf("expected name 'match', got %q", sol.Name)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watch event")
+	}
+
+	select {
+	case ev := <-w.ResultChan():
+		t.Errorf("unexpected second event: %v %v", ev.Type, ev.Object.(*internal.Solution).Name)
+	case <-time.After(100 * time.Millisecond):
+		// expected
+	}
+}
+
+func TestWatch_Stop(t *testing.T) {
+	store := registry.NewSolutionStorage()
+	ctx := ctxWithNamespace("default")
+
+	w, err := store.Watch(ctx, nil)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	w.Stop()
+
+	store.Create(ctx, &internal.Solution{
+		ObjectMeta: metav1.ObjectMeta{Name: "after-stop", Namespace: "default"},
+	}, func(_ context.Context, _ runtime.Object) error { return nil }, &metav1.CreateOptions{})
+
+	select {
+	case _, ok := <-w.ResultChan():
+		if ok {
+			t.Error("expected channel to be closed, got event")
+		}
+		// closed channel — correct
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out — channel neither closed nor received event")
 	}
 }
