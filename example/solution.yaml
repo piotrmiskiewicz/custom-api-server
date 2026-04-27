@@ -1,7 +1,6 @@
 apiVersion: solution.piotrmiskiewicz.github.com/v1alpha1
 kind: Solution
 metadata:
-  name: my-solution1
-  namespace: default
+  name: my-solution3
 spec:
   solutionName: somename
