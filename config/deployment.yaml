@@ -21,6 +21,26 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 8443
+          env:
+            - name: STORAGE_BACKEND
+              value: postgres
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_DB
+            - name: POSTGRES_DSN
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres.default.svc.cluster.local:5432/$(POSTGRES_DB)?sslmode=disable"
           readinessProbe:
             httpGet:
               path: /healthz
