@@ -2,16 +2,11 @@
 
 ## Connect with psql
 
-Run a one-off `psql` pod that connects to the in-cluster postgres service:
+Exec into the running postgres pod:
 
 ```bash
-kubectl run psql --rm -it --restart=Never \
-  --image=postgres:16 \
-  --env="PGPASSWORD=apiserver" \
-  -- psql -h postgres.default.svc.cluster.local -U apiserver -d apiserver
+kubectl exec -it deployment/postgres -- psql -U apiserver -d apiserver
 ```
-
-This opens an interactive `psql` session. The pod is deleted automatically when you exit.
 
 ## List all solutions
 
