@@ -320,6 +320,9 @@ func TestWatch_FieldSelectorFilter(t *testing.T) {
 
 	select {
 	case ev := <-w.ResultChan():
+		if ev.Type != watch.Added {
+			t.Errorf("expected Added, got %v", ev.Type)
+		}
 		sol := ev.Object.(*internal.Solution)
 		if sol.Name != "match" {
 			t.Errorf("expected name 'match', got %q", sol.Name)

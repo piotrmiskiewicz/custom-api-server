@@ -70,15 +70,21 @@ func NewSolutionStorage() *InMemoryStorage {
 func key(ns, name string) string { return ns + "/" + name }
 
 // broadcast sends an event to all active watchers and removes stopped ones.
-// Must be called with mu held (write lock).
+// Must be called without mu held.
 func (s *InMemoryStorage) broadcast(eventType watch.EventType, obj *internal.Solution) {
+	s.mu.Lock()
 	alive := s.watchers[:0]
 	for _, w := range s.watchers {
 		if w.send(eventType, obj) {
 			alive = append(alive, w)
 		}
 	}
+	// Nil out tail to allow GC of removed watchers.
+	for i := len(alive); i < len(s.watchers); i++ {
+		s.watchers[i] = nil
+	}
 	s.watchers = alive
+	s.mu.Unlock()
 }
 
 // --- rest.Scoper ---
@@ -161,9 +167,9 @@ func (s *InMemoryStorage) Create(ctx context.Context, obj runtime.Object, create
         return nil, err
     }
     s.mu.Lock()
-    defer s.mu.Unlock()
     k := key(ns, sol.Name)
     if _, exists := s.objects[k]; exists {
+        s.mu.Unlock()
         return nil, errors.NewAlreadyExists(solutionGR, sol.Name)
     }
     sol.UID = types.UID(uuid.NewUUID())
@@ -171,6 +177,7 @@ func (s *InMemoryStorage) Create(ctx context.Context, obj runtime.Object, create
     sol.CreationTimestamp = metav1.NewTime(time.Now())
     cp := sol.DeepCopyObject().(*internal.Solution)
     s.objects[k] = cp
+    s.mu.Unlock()
     s.broadcast(watch.Added, cp)
     return cp.DeepCopyObject(), nil
 }
@@ -178,17 +185,19 @@ func (s *InMemoryStorage) Create(ctx context.Context, obj runtime.Object, create
 func (s *InMemoryStorage) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, _ bool, _ *metav1.UpdateOptions) (runtime.Object, bool, error) {
     ns, _ := request.NamespaceFrom(ctx)
     s.mu.Lock()
-    defer s.mu.Unlock()
     k := key(ns, name)
     existing, ok := s.objects[k]
     if !ok {
+        s.mu.Unlock()
         return nil, false, errors.NewNotFound(solutionGR, name)
     }
     updated, err := objInfo.UpdatedObject(ctx, existing)
     if err != nil {
+        s.mu.Unlock()
         return nil, false, err
     }
     if err := updateValidation(ctx, updated, existing); err != nil {
+        s.mu.Unlock()
         return nil, false, err
     }
     sol := updated.(*internal.Solution)
@@ -196,6 +205,7 @@ func (s *InMemoryStorage) Update(ctx context.Context, name string, objInfo rest.
     sol.ResourceVersion = strconv.Itoa(rv + 1)
     cp := sol.DeepCopyObject().(*internal.Solution)
     s.objects[k] = cp
+    s.mu.Unlock()
     s.broadcast(watch.Modified, cp)
     return cp.DeepCopyObject(), false, nil
 }
@@ -203,16 +213,18 @@ func (s *InMemoryStorage) Update(ctx context.Context, name string, objInfo rest.
 func (s *InMemoryStorage) Delete(ctx context.Context, name string, deleteValidation rest.ValidateObjectFunc, _ *metav1.DeleteOptions) (runtime.Object, bool, error) {
     ns, _ := request.NamespaceFrom(ctx)
     s.mu.Lock()
-    defer s.mu.Unlock()
     k := key(ns, name)
     obj, ok := s.objects[k]
     if !ok {
+        s.mu.Unlock()
         return nil, false, errors.NewNotFound(solutionGR, name)
     }
     if err := deleteValidation(ctx, obj); err != nil {
+        s.mu.Unlock()
         return nil, false, err
     }
     delete(s.objects, k)
+    s.mu.Unlock()
     s.broadcast(watch.Deleted, obj)
     return obj, true, nil
 }
@@ -239,22 +251,26 @@ func (s *InMemoryStorage) Watch(ctx context.Context, opts *metainternalversion.L
 }
 
 func (s *InMemoryStorage) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, _ *metav1.DeleteOptions, listOpts *metainternalversion.ListOptions) (runtime.Object, error) {
-    listed, err := s.List(ctx, listOpts)
-    if err != nil {
-        return nil, err
-    }
-    sl := listed.(*internal.SolutionList)
-    ns, _ := request.NamespaceFrom(ctx)
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    for i := range sl.Items {
-        obj := &sl.Items[i]
-        if err := deleteValidation(ctx, obj); err != nil {
-            return nil, err
-        }
-        delete(s.objects, key(ns, obj.Name))
-    }
-    return sl, nil
+	listed, err := s.List(ctx, listOpts)
+	if err != nil {
+		return nil, err
+	}
+	sl := listed.(*internal.SolutionList)
+	ns, _ := request.NamespaceFrom(ctx)
+	s.mu.Lock()
+	for i := range sl.Items {
+		obj := &sl.Items[i]
+		if err := deleteValidation(ctx, obj); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+		delete(s.objects, key(ns, obj.Name))
+	}
+	s.mu.Unlock()
+	for i := range sl.Items {
+		s.broadcast(watch.Deleted, &sl.Items[i])
+	}
+	return sl, nil
 }
 
 func (s *InMemoryStorage) ConvertToTable(ctx context.Context, obj runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
@@ -264,26 +280,28 @@ func (s *InMemoryStorage) ConvertToTable(ctx context.Context, obj runtime.Object
 // UpdateStatus updates only the status field, preserving spec and metadata.
 // It implements the StatusUpdater interface.
 func (s *InMemoryStorage) UpdateStatus(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, error) {
-    ns, _ := request.NamespaceFrom(ctx)
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    k := key(ns, name)
-    existing, ok := s.objects[k]
-    if !ok {
-        return nil, errors.NewNotFound(solutionGR, name)
-    }
-    updated, err := objInfo.UpdatedObject(ctx, existing)
-    if err != nil {
-        return nil, err
-    }
-    updatedSol := updated.(*internal.Solution)
-    // Only copy status — spec and metadata remain from existing.
-    existing.Status = updatedSol.Status
-    rv, _ := strconv.Atoi(existing.ResourceVersion)
-    existing.ResourceVersion = strconv.Itoa(rv + 1)
-    cp := existing.DeepCopyObject().(*internal.Solution)
-    s.objects[k] = cp
-    return cp.DeepCopyObject(), nil
+	ns, _ := request.NamespaceFrom(ctx)
+	s.mu.Lock()
+	k := key(ns, name)
+	existing, ok := s.objects[k]
+	if !ok {
+		s.mu.Unlock()
+		return nil, errors.NewNotFound(solutionGR, name)
+	}
+	updated, err := objInfo.UpdatedObject(ctx, existing)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	updatedSol := updated.(*internal.Solution)
+	existing.Status = updatedSol.Status
+	rv, _ := strconv.Atoi(existing.ResourceVersion)
+	existing.ResourceVersion = strconv.Itoa(rv + 1)
+	cp := existing.DeepCopyObject().(*internal.Solution)
+	s.objects[k] = cp
+	s.mu.Unlock()
+	s.broadcast(watch.Modified, cp)
+	return cp.DeepCopyObject(), nil
 }
 
 // --- StatusREST ---
