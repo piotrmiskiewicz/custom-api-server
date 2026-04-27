@@ -45,6 +45,7 @@ type PostgresStorage struct {
 	watchMu        sync.Mutex
 	watchers       []*watcher
 	listenerCancel context.CancelFunc
+	listenerDone   chan struct{}
 }
 
 // NewPostgresStorage connects to the given DSN, creates the schema if needed,
@@ -64,8 +65,12 @@ func NewPostgresStorage(ctx context.Context, dsn string) (*PostgresStorage, erro
 		db:             pool,
 		dsn:            dsn,
 		listenerCancel: cancel,
+		listenerDone:   make(chan struct{}),
 	}
-	go s.listenLoop(lctx)
+	go func() {
+		s.listenLoop(lctx)
+		close(s.listenerDone)
+	}()
 	return s, nil
 }
 
@@ -226,6 +231,7 @@ func (s *PostgresStorage) NewList() runtime.Object { return &internal.SolutionLi
 
 func (s *PostgresStorage) Destroy() {
 	s.listenerCancel()
+	<-s.listenerDone
 	s.watchMu.Lock()
 	for _, w := range s.watchers {
 		w.Stop()
@@ -465,6 +471,11 @@ func (s *PostgresStorage) DeleteCollection(ctx context.Context, deleteValidation
 			return nil, fmt.Errorf("delete collection item %s: %w", obj.Name, err)
 		}
 	}
+	for i := range sl.Items {
+		if payload, err := s.notifyPayloadFor("DELETED", &sl.Items[i]); err == nil {
+			_, _ = s.db.Exec(ctx, `SELECT pg_notify('solutions', $1)`, payload)
+		}
+	}
 	return sl, nil
 }
 
@@ -511,7 +522,11 @@ func (s *PostgresStorage) UpdateStatus(ctx context.Context, name string, objInfo
 	// Rebuild the result: existing spec + new status + incremented RV.
 	existingSol.Status = updatedSol.Status
 	existingSol.ResourceVersion = strconv.Itoa(newRV)
-	return existingSol.DeepCopyObject(), nil
+	cp := existingSol.DeepCopyObject().(*internal.Solution)
+	if payload, err := s.notifyPayloadFor("MODIFIED", cp); err == nil {
+		_, _ = s.db.Exec(ctx, `SELECT pg_notify('solutions', $1)`, payload)
+	}
+	return cp, nil
 }
 
 // --- helpers ---
