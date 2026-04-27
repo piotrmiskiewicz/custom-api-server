@@ -169,12 +169,27 @@ func (s *PostgresStorage) listenLoop(ctx context.Context) {
 	fmt.Fprintf(os.Stderr, "postgres watch: listener failed after %d attempts, no more watch events\n", maxAttempts)
 }
 
-// listenOnce opens a dedicated pgconn connection, runs LISTEN, and loops on
-// WaitForNotification until the context is cancelled or an error occurs.
+// listenOnce opens a dedicated pgconn connection, registers an OnNotification
+// callback, runs LISTEN, and blocks on WaitForNotification until the context
+// is cancelled or an error occurs.
 func (s *PostgresStorage) listenOnce(ctx context.Context) error {
-	conn, err := pgconn.Connect(ctx, s.dsn)
+	cfg, err := pgconn.ParseConfig(s.dsn)
 	if err != nil {
-		return fmt.Errorf("pgconn.Connect: %w", err)
+		return fmt.Errorf("parse dsn: %w", err)
+	}
+
+	notifications := make(chan *pgconn.Notification, 64)
+	cfg.OnNotification = func(_ *pgconn.PgConn, n *pgconn.Notification) {
+		select {
+		case notifications <- n:
+		default:
+			// channel full — drop
+		}
+	}
+
+	conn, err := pgconn.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("pgconn.ConnectConfig: %w", err)
 	}
 	defer conn.Close(context.Background())
 
@@ -183,35 +198,42 @@ func (s *PostgresStorage) listenOnce(ctx context.Context) error {
 	}
 
 	for {
-		n, err := conn.WaitForNotification(ctx)
-		if err != nil {
+		if err := conn.WaitForNotification(ctx); err != nil {
 			if ctx.Err() != nil {
 				return nil // clean shutdown
 			}
 			return err // connection lost
 		}
 
-		var p notifyPayload
-		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
-			continue
+		// Drain all notifications that arrived.
+		for {
+			select {
+			case n := <-notifications:
+				var p notifyPayload
+				if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
+					continue
+				}
+				sol, err := payloadToSolution(&p)
+				if err != nil {
+					continue
+				}
+				var eventType watch.EventType
+				switch p.Type {
+				case "ADDED":
+					eventType = watch.Added
+				case "MODIFIED":
+					eventType = watch.Modified
+				case "DELETED":
+					eventType = watch.Deleted
+				default:
+					continue
+				}
+				s.broadcast(eventType, sol)
+			default:
+				goto drained
+			}
 		}
-		sol, err := payloadToSolution(&p)
-		if err != nil {
-			continue
-		}
-
-		var eventType watch.EventType
-		switch p.Type {
-		case "ADDED":
-			eventType = watch.Added
-		case "MODIFIED":
-			eventType = watch.Modified
-		case "DELETED":
-			eventType = watch.Deleted
-		default:
-			continue
-		}
-		s.broadcast(eventType, sol)
+	drained:
 	}
 }
 
