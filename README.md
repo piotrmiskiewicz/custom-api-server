@@ -33,6 +33,10 @@ kubectl --server=https://localhost:8444 --insecure-skip-tls-verify get solutions
 
 ## Play with k3d
 
+### Prerequisites
+
+Build and push the Docker image before deploying. See [docs/docker.md](docs/docker.md) for instructions.
+
 1. Start a k3d cluster:
 
 ```bash
